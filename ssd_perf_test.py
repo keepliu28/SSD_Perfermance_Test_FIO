@@ -25,6 +25,9 @@ SCRIPT_VERSION = "2.5.0"
 DATA_VALIDATION_SAMPLES = 3
 TEST_RETRY_COUNT = 2
 
+# 单位转换常数
+MIB_TO_MBS = 1.048576  # 1 MiB/s = 1.048576 MB/s
+
 
 # 颜色输出
 class Colors:
@@ -312,7 +315,6 @@ class SSDPerformanceTester:
             f"--rw={rw_pattern}",
             f"--bs={block_size}",
             f"--runtime={self.test_duration}",
-            f"--ramp_time={self.test_duration // 2}",  # ramp_time设置为runtime的一半
             "--time_based=1",
             "--size=100%",
             "--refill_buffers",
@@ -328,8 +330,6 @@ class SSDPerformanceTester:
         if sample_id == 0:
             cmd_str = ' '.join(fio_cmd)
             self.log("INFO", f"FIO命令: {cmd_str}")
-            # 显示关键参数关系
-            self.log("INFO", f"关键参数: runtime={self.test_duration}s, ramp_time={self.test_duration // 2}s")
         
         # 执行命令
         start_time = time.time()
@@ -434,9 +434,12 @@ class SSDPerformanceTester:
             print(f"调试: job name={job.get('jobname', '')}")
             print(f"调试: read io_bytes={read_data.get('io_bytes', 0)}, write io_bytes={write_data.get('io_bytes', 0)}")
         
-        # FIO的bw单位是KiB/s,需要转换为MiB/s (除以1024)
-        read_bw_mib = read_data.get("bw", 0) / 1024.0
-        write_bw_mib = write_data.get("bw", 0) / 1024.0
+        # 从bw_bytes提取并转换为MB/s (1 MiB/s = 1.048576 MB/s)
+        # bw_bytes单位是bytes/sec，需要转换为MB/s: bytes/sec / 1024^2 = MiB/s，再转换为MB/s
+        read_bw_mib = read_data.get("bw_bytes", 0) / (1024 * 1024)  # 转换为MiB/s
+        write_bw_mib = write_data.get("bw_bytes", 0) / (1024 * 1024)  # 转换为MiB/s
+        read_bw_mbs = read_bw_mib * MIB_TO_MBS  # 转换为MB/s
+        write_bw_mbs = write_bw_mib * MIB_TO_MBS  # 转换为MB/s
         
         # 根据实际的数据来判断读写模式,而不是依赖rw字段
         read_io_bytes = read_data.get("io_bytes", 0)
@@ -447,24 +450,24 @@ class SSDPerformanceTester:
             if "rand" in rw_mode or job.get("jobname", "").startswith("random"):
                 primary_metric = read_data.get("iops", 0)  # 随机读用IOPS
             else:
-                primary_metric = read_bw_mib  # 顺序读用带宽(MiB/s)
+                primary_metric = read_bw_mbs  # 顺序读用带宽(MB/s)
         else:
             if "rand" in rw_mode or job.get("jobname", "").startswith("random"):
                 primary_metric = write_data.get("iops", 0)  # 随机写用IOPS
             else:
-                primary_metric = write_bw_mib  # 顺序写用带宽(MiB/s)
+                primary_metric = write_bw_mbs  # 顺序写用带宽(MB/s)
         
         # 调试信息
         if self.debug_mode:
             print(f"调试: 主要指标={primary_metric}")
-            print(f"调试: read_bw={read_bw_mib:.2f} MiB/s, read_iops={read_data.get('iops', 0)}")
-            print(f"调试: write_bw={write_bw_mib:.2f} MiB/s, write_iops={write_data.get('iops', 0)}")
+            print(f"调试: read_bw={read_bw_mbs:.2f} MB/s, read_iops={read_data.get('iops', 0)}")
+            print(f"调试: write_bw={write_bw_mbs:.2f} MB/s, write_iops={write_data.get('iops', 0)}")
             
         return {
-            "read_bw": read_bw_mib,
+            "read_bw": read_bw_mbs,
             "read_iops": read_data.get("iops", 0),
             "read_lat": read_data.get("lat_ns", {}).get("mean", 0) / 1000,
-            "write_bw": write_bw_mib,
+            "write_bw": write_bw_mbs,
             "write_iops": write_data.get("iops", 0),
             "write_lat": write_data.get("lat_ns", {}).get("mean", 0) / 1000,
             "primary_metric": primary_metric,
@@ -596,15 +599,13 @@ class SSDPerformanceTester:
         total_tests = len(test_configs)
         self.log("INFO", f"开始执行优化版SSD性能测试流程 {total_tests} 个测试用例...")
 
-        # 第一步：顺序写预热(使用与主测试相同的runtime参数)
-        warmup_time = self.test_duration  # 使用主测试的runtime参数
-        ramp_time = self.test_duration // 2  # ramp_time为runtime的一半
-        self.log("INFO", f"第一阶段：顺序写预热{warmup_time}秒 [QD128/Job1, ramp_time: {ramp_time}秒]")
+        # 第一步：顺序写预热(使用ramp_time参数)
+        warmup_time = self.ramp_time  # 使用ramp_time参数
+        self.log("INFO", f"第一阶段：顺序写预热{warmup_time}秒 [QD128/Job1]")
         try:
             seq_warmup_cmd = ["fio", "--name=seq_warmup", f"--filename=/dev/{self.device}",
                               "--rw=write", "--bs=128k", "--ioengine=libaio", "--direct=1",
-                              "--numjobs=1", "--iodepth=128", f"--runtime={warmup_time}", 
-                              f"--ramp_time={ramp_time}", "--time_based=1",
+                              "--numjobs=1", "--iodepth=128", f"--runtime={warmup_time}", "--time_based=1",
                               "--size=100%", "--refill_buffers", "--end_fsync=1", 
                               "--norandommap=1", "--randrepeat=0", "--group_reporting",
                               "--output-format=json", "--output=/tmp/seq_warmup.json"]
@@ -623,16 +624,14 @@ class SSDPerformanceTester:
             numjobs = config["numjobs"]
             stage = config["stage"]
             
-            # 特殊处理：第四步随机写预热(使用与主测试相同的runtime参数)
+            # 特殊处理：第四步随机写预热(使用ramp_time参数)
             if i == 3:  # 在随机写测试前进行预热
-                warmup_time = self.test_duration  # 使用主测试的runtime参数
-                ramp_time = self.test_duration // 2  # ramp_time为runtime的一半
-                self.log("INFO", f"第四阶段：随机写预热{warmup_time}秒 [QD32/Job8, ramp_time: {ramp_time}秒]")
+                warmup_time = self.ramp_time  # 使用ramp_time参数
+                self.log("INFO", f"第四阶段：随机写预热{warmup_time}秒 [QD32/Job8]")
                 try:
                     rand_warmup_cmd = ["fio", "--name=rand_warmup", f"--filename=/dev/{self.device}",
                                       "--rw=randwrite", "--bs=4k", "--ioengine=libaio", "--direct=1",
-                                      "--numjobs=8", "--iodepth=32", f"--runtime={warmup_time}", 
-                                      f"--ramp_time={ramp_time}", "--time_based=1",
+                                      "--numjobs=8", "--iodepth=32", f"--runtime={warmup_time}", "--time_based=1",
                                       "--size=100%", "--refill_buffers", "--end_fsync=1",
                                       "--norandommap=1", "--randrepeat=0", "--group_reporting",
                                       "--output-format=json", "--output=/tmp/rand_warmup.json"]
@@ -652,7 +651,7 @@ class SSDPerformanceTester:
                 # 显示性能结果
                 mean_value = result.statistics.get("mean", 0)
                 if "seq" in result.test_type:
-                    performance_str = f"{mean_value:.2f} MiB/s"
+                    performance_str = f"{mean_value:.2f} MB/s"
                 else:
                     performance_str = f"{mean_value:.0f} IOPS"
 
@@ -690,7 +689,7 @@ class SSDPerformanceTester:
             for result in results:
                 # 确定正确的单位
                 if "seq" in result.test_type:
-                    unit = "MiB/s"
+                    unit = "MB/s"
                     format_str = f"{result.statistics.get('mean', 0):.2f}"
                 else:
                     unit = "IOPS"
@@ -832,39 +831,21 @@ python3 ssd_perf_test_v2_fixed.py nvme0n1 --debug
 5. 4K随机写入测试 (使用-t参数指定时间, 默认10分钟, 队列深度:32, 任务数:8)
 6. 4K随机读取测试 (使用-t参数指定时间, 默认10分钟, 队列深度:32, 任务数:8)
 
-总执行时间: 预热时间(--ramp_time默认20分钟) + 测试时间 (默认40分钟)
+总执行时间: 预热时间(默认20分钟) + 测试时间 (默认40分钟)
 
 预热策略说明:
 • 顺序写预热使用与顺序写完全相同的参数配置 (QD128/Job1)
 • 随机写预热使用与随机写完全相同的参数配置 (QD32/Job8)
 • --ramp_time参数默认自动设置为-t参数值的一半,也可手动指定
 
-=== FIO参数配置方案 ===
-
-主测试阶段参数配置:
-• --runtime: 使用-t参数指定的测试时间 (默认: 600秒)
-• --ramp_time: 自动设置为runtime值的1/2 (默认: 300秒)
-• 有效测量时间: runtime - ramp_time (默认: 300秒)
-
-预热阶段参数配置:
-• --runtime: 使用与主测试相同的runtime值 (默认: 600秒)
-• --ramp_time: 自动设置为runtime值的1/2 (默认: 300秒)
-• 预热方式: 前半段为预热期,后半段为稳定测试期
-
 测试模型说明:
-• 128K顺序读/QD128/Job1 - 大文件顺序读写性能
-• 128K顺序写/QD128/Job1 - 大文件顺序写入性能  
-• 4K随机读/QD32/Job8 - 小文件随机读取性能
-• 4K随机写/QD32/Job8 - 小文件随机写入性能
+• 128K顺序读/QD128/Job1 - 大文件顺序读写性能 (MB/s)
+• 128K顺序写/QD128/Job1 - 大文件顺序写入性能 (MB/s)
+• 4K随机读/QD32/Job8 - 小文件随机读取性能 (IOPS)
+• 4K随机写/QD32/Job8 - 小文件随机写入性能 (IOPS)
 
-FIO命令示例(128K顺序写入, -t 60):
-fio --name=sequential_128k_write --filename=/dev/nvme0n1 --ioengine=libaio --direct=1 --numjobs=1 --iodepth=128 --rw=write --bs=128k --runtime=60 --ramp_time=30 --time_based=1 --size=100% --refill_buffers --end_fsync=1 --norandommap=1 --randrepeat=0 --group_reporting --output-format=json --output=sequential_128k_write.json
-
-参数关系说明:
-• runtime = 测试总时间 (例如: 60秒)
-• ramp_time = runtime ÷ 2 (例如: 30秒)
-• 前30秒: 预热期 (数据不用于性能统计)
-• 后30秒: 测量期 (数据用于性能统计)
+FIO命令示例(128K顺序写入):
+fio --name=sequential_128k_write --filename=/dev/nvme0n1 --ioengine=libaio --direct=1 --numjobs=1 --iodepth=128 --rw=write --bs=128k --runtime=30 --time_based=1 --size=100% --refill_buffers --end_fsync=1 --norandommap=1 --randrepeat=0 --group_reporting --output-format=json --output=sequential_128k_write.json
 
 变异系数(CV)说明:
 • CV < 0.1: 数据稳定性极好(标准差/均值 < 10%)
@@ -1003,7 +984,7 @@ fio --name=sequential_128k_write --filename=/dev/nvme0n1 --ioengine=libaio --dir
             
             # 根据测试类型确定格式和单位
             if "seq" in result.test_type:
-                mean_str = f"{mean_value:.2f} MiB/s"
+                mean_str = f"{mean_value:.2f} MB/s"
                 icon = "📁" if result.rw_pattern == "write" else "📖"
             else:
                 mean_str = f"{mean_value:,.0f} IOPS"
@@ -1017,78 +998,42 @@ fio --name=sequential_128k_write --filename=/dev/nvme0n1 --ioengine=libaio --dir
             print(f"     CV: {cv:.3f} | 质量: {quality_color}{quality}{Colors.END}")
 
     def _display_performance_conclusions(self, performance_summary: Dict[str, Any], cv_analysis: Dict[str, Any]):
-        """显示性能评估结论"""
-        print(f"\n{Colors.BOLD}🎯 性能评估结论{Colors.END}")
-        
-        # 关键性能指标
-        conclusions = []
-        
-        if performance_summary["sequential_read"]:
-            if performance_summary["sequential_read"] > 5000:
-                conclusions.append(f"✅ 顺序读取性能卓越 ({performance_summary['sequential_read']:.0f} MiB/s)")
-            elif performance_summary["sequential_read"] > 3000:
-                conclusions.append(f"✅ 顺序读取性能良好 ({performance_summary['sequential_read']:.0f} MiB/s)")
-            else:
-                conclusions.append(f"⚠️  顺序读取性能一般 ({performance_summary['sequential_read']:.0f} MiB/s)")
-        
-        if performance_summary["random_read"]:
-            if performance_summary["random_read"] > 500000:
-                conclusions.append(f"✅ 随机读取性能优秀 ({performance_summary['random_read']:,.0f} IOPS)")
-            elif performance_summary["random_read"] > 300000:
-                conclusions.append(f"✅ 随机读取性能良好 ({performance_summary['random_read']:,.0f} IOPS)")
-            else:
-                conclusions.append(f"⚠️  随机读取性能一般 ({performance_summary['random_read']:,.0f} IOPS)")
-        
-        if performance_summary["sequential_write"]:
-            if performance_summary["sequential_write"] > 2000:
-                conclusions.append(f"✅ 顺序写入性能优秀 ({performance_summary['sequential_write']:.0f} MiB/s)")
-            elif performance_summary["sequential_write"] > 1000:
-                conclusions.append(f"✅ 顺序写入性能良好 ({performance_summary['sequential_write']:.0f} MiB/s)")
-            else:
-                conclusions.append(f"⚠️  顺序写入性能一般 ({performance_summary['sequential_write']:.0f} MiB/s)")
-        
-        if performance_summary["random_write"]:
-            if performance_summary["random_write"] > 400000:
-                conclusions.append(f"✅ 随机写入性能优秀 ({performance_summary['random_write']:,.0f} IOPS)")
-            elif performance_summary["random_write"] > 200000:
-                conclusions.append(f"✅ 随机写入性能良好 ({performance_summary['random_write']:,.0f} IOPS)")
-            else:
-                conclusions.append(f"⚠️  随机写入性能一般 ({performance_summary['random_write']:,.0f} IOPS)")
-        
-        # 显示结论
-        for conclusion in conclusions:
-            print(f"  {conclusion}")
-
-        # 综合评价
-        print(f"\n{Colors.BOLD}📋 综合评价{Colors.END}")
+        """显示基于CV的性能评估结论"""
+        print(f"\n{Colors.BOLD}🎯 数据稳定性评估结论{Colors.END}")
         
         # 基于CV稳定性的综合评价
         if cv_analysis['avg_cv'] < 0.01:
             stability_desc = "数据极其稳定"
             reliability = "极高"
+            recommendation = "测试结果高度可靠，可用于重要性能评估"
         elif cv_analysis['avg_cv'] < 0.05:
             stability_desc = "数据高度稳定" 
             reliability = "很高"
+            recommendation = "测试结果可靠，建议作为基准性能参考"
         elif cv_analysis['avg_cv'] < 0.1:
             stability_desc = "数据稳定性优秀"
             reliability = "高"
+            recommendation = "测试结果较为可靠，适合一般性能评估"
         else:
             stability_desc = "数据存在波动"
             reliability = "中等"
+            recommendation = "建议增加测试次数以获得更稳定的结果"
         
         print(f"  🔍 稳定性: {stability_desc} (平均CV: {cv_analysis['avg_cv']:.3f})")
         print(f"  🎯 可靠性: {reliability}")
-
-        # 性能等级判断
-        high_performance_count = sum(1 for c in conclusions if "✅" in c and ("优秀" in c or "卓越" in c))
-        if high_performance_count >= 3:
-            print(f"  🏆 性能等级: 旗舰级 SSD")
-        elif high_performance_count >= 2:
-            print(f"  🥇 性能等级: 高性能 SSD") 
-        elif high_performance_count >= 1:
-            print(f"  🥈 性能等级: 标准级 SSD")
-        else:
-            print(f"  🥉 性能等级: 入门级 SSD")
+        print(f"  💡 建议: {recommendation}")
+        
+        # CV质量分布统计
+        cv_values = cv_analysis.get('cv_values', [])
+        if cv_values:
+            excellent_count = sum(1 for cv in cv_values if cv < 0.05)
+            good_count = sum(1 for cv in cv_values if 0.05 <= cv < 0.1)
+            poor_count = sum(1 for cv in cv_values if cv >= 0.1)
+            
+            print(f"\n{Colors.BOLD}📊 CV质量分布{Colors.END}")
+            print(f"  优秀(CV<0.05): {excellent_count}/{len(cv_values)} 项测试")
+            print(f"  良好(0.05≤CV<0.1): {good_count}/{len(cv_values)} 项测试")
+            print(f"  波动较大(CV≥0.1): {poor_count}/{len(cv_values)} 项测试")
 
     def _display_failed_tests(self, failed_tests: List[TestResult]):
         """显示失败测试信息"""

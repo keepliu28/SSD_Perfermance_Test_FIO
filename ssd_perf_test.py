@@ -315,6 +315,7 @@ class SSDPerformanceTester:
             f"--rw={rw_pattern}",
             f"--bs={block_size}",
             f"--runtime={self.test_duration}",
+            f"--ramp_time={self.ramp_time}",
             "--time_based=1",
             "--size=100%",
             "--refill_buffers",
@@ -845,7 +846,7 @@ python3 ssd_perf_test_v2_fixed.py nvme0n1 --debug
 • 4K随机写/QD32/Job8 - 小文件随机写入性能 (IOPS)
 
 FIO命令示例(128K顺序写入):
-fio --name=sequential_128k_write --filename=/dev/nvme0n1 --ioengine=libaio --direct=1 --numjobs=1 --iodepth=128 --rw=write --bs=128k --runtime=30 --time_based=1 --size=100% --refill_buffers --end_fsync=1 --norandommap=1 --randrepeat=0 --group_reporting --output-format=json --output=sequential_128k_write.json
+fio --name=sequential_128k_write --filename=/dev/nvme0n1 --ioengine=libaio --direct=1 --numjobs=1 --iodepth=128 --rw=write --bs=128k --runtime=30 --ramp_time=15 --time_based=1 --size=100% --refill_buffers --end_fsync=1 --norandommap=1 --randrepeat=0 --group_reporting --output-format=json --output=sequential_128k_write.json
 
 变异系数(CV)说明:
 • CV < 0.1: 数据稳定性极好(标准差/均值 < 10%)

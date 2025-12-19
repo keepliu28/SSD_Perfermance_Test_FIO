@@ -304,6 +304,8 @@ class SSDPerformanceTester:
         test_numjobs = numjobs if numjobs is not None else self.threads
         
         # 构建FIO命令
+        # 如果用户通过 --size 指定了测试大小，则优先使用；否则默认 100%
+        fio_size = self.custom_test_size or "100%"
         fio_cmd = [
             "fio",
             f"--name={output_prefix}",
@@ -317,7 +319,7 @@ class SSDPerformanceTester:
             f"--runtime={self.test_duration}",
             f"--ramp_time={self.ramp_time}",
             "--time_based=1",
-            "--size=100%",
+            f"--size={fio_size}",
             "--refill_buffers",
             "--end_fsync=1",
             "--norandommap=1",
@@ -339,6 +341,13 @@ class SSDPerformanceTester:
         
         if result.returncode != 0:
             error_msg = f"命令执行失败 (返回码: {result.returncode})"
+            # 尽可能把 FIO 的 stderr/stdout 关键信息打到日志里，方便排查问题
+            stderr_preview = (result.stderr or "").strip()
+            stdout_preview = (result.stdout or "").strip()
+            if stderr_preview:
+                self.log("ERROR", f"FIO stderr: {stderr_preview[:800]}")
+            if stdout_preview:
+                self.log("ERROR", f"FIO stdout: {stdout_preview[:400]}")
             self.log("ERROR", f"=== 命令执行失败详情 ===")
             raise Exception(error_msg)
         
@@ -603,11 +612,12 @@ class SSDPerformanceTester:
         # 第一步：顺序写预热(使用ramp_time参数)
         warmup_time = self.ramp_time  # 使用ramp_time参数
         self.log("INFO", f"第一阶段：顺序写预热{warmup_time}秒 [QD128/Job1]")
+        warmup_size = self.custom_test_size or "100%"
         try:
             seq_warmup_cmd = ["fio", "--name=seq_warmup", f"--filename=/dev/{self.device}",
                               "--rw=write", "--bs=128k", "--ioengine=libaio", "--direct=1",
                               "--numjobs=1", "--iodepth=128", f"--runtime={warmup_time}", "--time_based=1",
-                              "--size=100%", "--refill_buffers", "--end_fsync=1", 
+                              f"--size={warmup_size}", "--refill_buffers", "--end_fsync=1", 
                               "--norandommap=1", "--randrepeat=0", "--group_reporting",
                               "--output-format=json", "--output=/tmp/seq_warmup.json"]
             
@@ -629,11 +639,12 @@ class SSDPerformanceTester:
             if i == 3:  # 在随机写测试前进行预热
                 warmup_time = self.ramp_time  # 使用ramp_time参数
                 self.log("INFO", f"第四阶段：随机写预热{warmup_time}秒 [QD32/Job8]")
+                warmup_size = self.custom_test_size or "100%"
                 try:
                     rand_warmup_cmd = ["fio", "--name=rand_warmup", f"--filename=/dev/{self.device}",
                                       "--rw=randwrite", "--bs=4k", "--ioengine=libaio", "--direct=1",
                                       "--numjobs=8", "--iodepth=32", f"--runtime={warmup_time}", "--time_based=1",
-                                      "--size=100%", "--refill_buffers", "--end_fsync=1",
+                                      f"--size={warmup_size}", "--refill_buffers", "--end_fsync=1",
                                       "--norandommap=1", "--randrepeat=0", "--group_reporting",
                                       "--output-format=json", "--output=/tmp/rand_warmup.json"]
                     
@@ -651,7 +662,8 @@ class SSDPerformanceTester:
 
                 # 显示性能结果
                 mean_value = result.statistics.get("mean", 0)
-                if "seq" in result.test_type:
+                # 使用明确的类型判断，避免字符串包含关系产生歧义
+                if result.test_type == "sequential":
                     performance_str = f"{mean_value:.2f} MB/s"
                 else:
                     performance_str = f"{mean_value:.0f} IOPS"
@@ -689,7 +701,7 @@ class SSDPerformanceTester:
             
             for result in results:
                 # 确定正确的单位
-                if "seq" in result.test_type:
+                if result.test_type == "sequential":
                     unit = "MB/s"
                     format_str = f"{result.statistics.get('mean', 0):.2f}"
                 else:
@@ -763,8 +775,10 @@ class SSDPerformanceTester:
         parser.add_argument("-h", "--help", action="store_true", help="显示帮助信息")
         
         try:
+            # argparse 在解析错误时会调用 sys.exit，这里捕获 SystemExit，
+            # 统一打印帮助信息并返回 False，避免脚本直接退出
             args = parser.parse_args()
-        except argparse.ArgumentError:
+        except SystemExit:
             self.show_help()
             return False
         
@@ -806,10 +820,10 @@ class SSDPerformanceTester:
 SSD性能测试脚本 v{SCRIPT_VERSION} (修复版本)
 
 用法:
-    python ssd_perf_test_v2_fixed.py [选项] <设备名>
+    python ssd_perf_test.py [选项] <设备名>
 
 建议的测试命令:
-python3 ssd_perf_test_v2_fixed.py nvme0n1 --debug
+    python3 ssd_perf_test.py nvme0n1 --debug
 
 必需参数:
     <设备名>         要测试的SSD设备名 (如: sda, nvme0n1)
